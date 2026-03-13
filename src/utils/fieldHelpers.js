@@ -41,10 +41,17 @@ function updateField(fields, key, value, sourceText, status = 'found', needsRevi
     return;
   }
 
+  const hasValue = value !== undefined && value !== null && String(value).trim() !== '';
+
+  if (!hasValue) {
+    fields[key] = createEmptyField();
+    return;
+  }
+
   fields[key] = {
-    value: value || null,
+    value: String(value).trim(),
     status,
-    source_text: sourceText || null,
+    source_text: sourceText ? String(sourceText).trim() : null,
     needs_review: needsReview
   };
 }
@@ -58,20 +65,23 @@ function findRegexValue(text, regex) {
 }
 
 function buildCompleteness(fields) {
+  // NOTE: logique de complétude consolidée après résolution de conflits.
   const foundFields = [];
   const missingFields = [];
   const reviewFields = [];
 
   Object.entries(fields).forEach(([key, data]) => {
-    if (data.status === 'found' || data.status === 'inferred') {
+    const hasValue = data.value !== null && data.value !== undefined && String(data.value).trim() !== '';
+
+    if (hasValue && ['found', 'inferred', 'ambiguous'].includes(data.status)) {
       foundFields.push(key);
     }
 
-    if (data.status === 'missing' || data.status === 'manual_required') {
+    if (!hasValue || data.status === 'missing' || data.status === 'manual_required') {
       missingFields.push(key);
     }
 
-    if (data.needs_review || data.status === 'ambiguous') {
+    if (data.status === 'ambiguous' || data.needs_review) {
       reviewFields.push(key);
     }
   });
