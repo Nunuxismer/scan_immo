@@ -65,6 +65,7 @@ function findRegexValue(text, regex) {
 }
 
 function buildCompleteness(fields) {
+  // NOTE: logique de complétude consolidée après résolution de conflits.
   const foundFields = [];
   const missingFields = [];
   const reviewFields = [];

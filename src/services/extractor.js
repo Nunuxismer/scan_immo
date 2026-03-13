@@ -64,6 +64,7 @@ function formatEuroValue(amount) {
 }
 
 function extractBestPrice(pageData) {
+  // NOTE: ce bloc est la version consolidée retenue lors de la résolution de conflits.
   // Heuristique ciblée: privilégier le prix lié au bien (pas loyer/charges/honoraires)
   // 1) JSON-LD price, 2) lignes contenant "prix", 3) fallback max montant raisonnable.
   const candidates = [];
@@ -143,6 +144,7 @@ function extractHeatingFromText(text) {
 }
 
 function extractLocation(pageData) {
+  // NOTE: extraction géographique consolidée (titre/H1/main content).
   const locationRegex = /(?:\b[a-zàâçéèêëîïôûùüÿñæœ]+(?:[-\s][a-zàâçéèêëîïôûùüÿñæœ]+){0,4}\b)\s*\((\d{5})\)/i;
   const texts = [pageData.h1Text, pageData.pageTitle, pageData.cleanedMainText, pageData.ogTitle].filter(Boolean);
 
