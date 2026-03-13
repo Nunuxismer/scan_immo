@@ -1,0 +1,24 @@
+{
+  "name": "scan-immo-playwright-service",
+  "version": "1.0.0",
+  "description": "Microservice Playwright V1 pour extraction d'annonces immobilières",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "lint": "node --check src/server.js && node --check src/app.js && node --check src/routes/extract.js && node --check src/services/extractor.js && node --check src/utils/validators.js && node --check src/utils/fieldHelpers.js"
+  },
+  "keywords": [
+    "playwright",
+    "express",
+    "immobilier",
+    "scraping"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.53.0"
+  }
+}
