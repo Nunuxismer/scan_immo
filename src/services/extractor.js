@@ -179,18 +179,58 @@ async function collectPageData(page) {
       }
     };
 
-    const isLikelyUsefulImage = (item) => {
+    const normalizeImageUrl = (rawUrl) => {
+      const absolute = absoluteUrl(rawUrl);
+      if (!absolute) return null;
+      try {
+        const parsed = new URL(absolute);
+        parsed.hash = '';
+        return parsed.toString();
+      } catch (_error) {
+        return absolute;
+      }
+    };
+
+    const isLikelyPropertyImage = (item) => {
       if (!item.url) return false;
       const lowered = item.url.toLowerCase();
       const context = `${item.alt || ''} ${item.className || ''} ${item.parentClass || ''}`.toLowerCase();
 
       if (lowered.startsWith('data:')) return false;
-      if (/logo|icon|sprite|favicon|placeholder/.test(lowered)) return false;
-      if (/avatar|profil|profile|agent|conseiller|author/.test(lowered)) return false;
-      if (/avatar|profil|profile|agent|conseiller/.test(context)) return false;
+
+      const blockedUrlTokens = [
+        'maps.googleapis.com/maps/vt',
+        'googleapis.com/maps',
+        'google.com/maps',
+        'whatsapp',
+        'logo',
+        'icon',
+        'avatar',
+        'profile',
+        'bed-test',
+        'plan-test',
+        'leaf-test',
+        'marker',
+        'pin',
+        'sprite',
+        'thumbnail-default',
+        'favicon',
+        'placeholder'
+      ];
+
+      if (blockedUrlTokens.some((token) => lowered.includes(token))) return false;
+      if (/avatar|profil|profile|agent|conseiller|author/.test(context)) return false;
+
       if (item.width && item.height && item.width < 180 && item.height < 180) return false;
 
-      return true;
+      const hasKnownImageExt = /\.(jpg|jpeg|png|webp|avif)(\?|$)/i.test(lowered);
+      const hasExplicitNonImageExt = /\.(svg|gif|ico|woff2?|ttf|eot|mp4|webm|pdf)(\?|$)/i.test(lowered);
+      if (hasExplicitNonImageExt) return false;
+
+      // Cas fréquent M-OI: on garde explicitement les photos métier du dossier properties.
+      if (lowered.includes('/img/properties/')) return true;
+
+      return hasKnownImageExt || /\/photos?\//i.test(lowered) || /\/images?\//i.test(lowered);
     };
 
     const imageCandidates = [];
