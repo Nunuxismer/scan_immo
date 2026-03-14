@@ -372,6 +372,25 @@ async function collectPageData(page) {
     const mainTextBlocks = collectText(mainContainer).slice(0, 700);
     const bodyTextBlocks = collectText(document.body).slice(0, 1000);
 
+    const breadcrumbSelectors = [
+      'nav[aria-label*=\"breadcrumb\" i]',
+      '[role=\"navigation\"][aria-label*=\"fil\" i]',
+      '[class*=\"breadcrumb\" i]',
+      '[data-testid*=\"breadcrumb\" i]'
+    ];
+
+    let breadcrumbText = '';
+    for (const selector of breadcrumbSelectors) {
+      const node = document.querySelector(selector);
+      if (node) {
+        const nodeText = (node.innerText || '').replace(/\s+/g, ' ').trim();
+        if (nodeText) {
+          breadcrumbText = nodeText;
+          break;
+        }
+      }
+    }
+
     return {
       pageTitle: title,
       h1Text,
@@ -381,10 +400,141 @@ async function collectPageData(page) {
       jsonLdPrice,
       cleanedMainText: mainTextBlocks.join('\n'),
       fallbackText: bodyTextBlocks.join('\n'),
+      breadcrumbText,
       imageUrls: imageUrls.slice(0, maxImages),
       imageFilterDebug
     };
   }, { maxImages: config.maxImages });
+}
+
+function inferSourceType(sourceText, sourceHint = '') {
+  const normalized = `${sourceHint || ''} ${sourceText || ''}`.toLowerCase();
+  if (normalized.includes('jsonld')) return 'json_ld';
+  if (normalized.includes('meta') || normalized.includes('og:')) return 'meta_tag';
+  if (normalized.includes('url') || normalized.includes('domaine') || normalized.includes('domain')) return 'url';
+  if (normalized.includes('h1') || normalized.includes('title')) return 'title';
+  return 'body_text';
+}
+
+function extractReferenceFromUrl(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+    const slugTokens = `${parsed.pathname} ${parsed.search}`.match(/[A-Za-z]{1,5}[-_]?[0-9]{4,}|[0-9]{5,}/g) || [];
+    return slugTokens.length ? slugTokens[0] : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function buildRegexCandidates(text, regex, field, sourceType, confidence = 0.6) {
+  if (!text) return [];
+  const matches = [...text.matchAll(regex)];
+  return matches.slice(0, 8).map((match) => ({
+    field,
+    value: (match[1] || match[0] || '').trim(),
+    source_text: (match[0] || '').trim(),
+    source_type: sourceType,
+    confidence
+  })).filter((item) => item.value);
+}
+
+
+function extractUrlTokens(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+    const seen = new Set();
+
+    return decodeURIComponent(parsed.pathname || '')
+      .toLowerCase()
+      .split(/[\s\/_-]+/g)
+      .map((token) => token.trim())
+      .filter((token) => token && !seen.has(token) && (seen.add(token) || true));
+  } catch (_error) {
+    return [];
+  }
+}
+
+function buildCandidateItem(match, contextText, sourceType, options = {}) {
+  const valueRaw = (match?.[0] || '').trim();
+  if (!valueRaw) return null;
+
+  const normalizedValue = options.normalizer ? options.normalizer(valueRaw, match) : null;
+
+  return {
+    value_raw: valueRaw,
+    normalized_value: normalizedValue,
+    unit: options.unit || null,
+    context: (contextText || '').slice(0, 220),
+    source_type: sourceType
+  };
+}
+
+function buildGenericCandidates(sourceEntries, regex, options = {}) {
+  const output = [];
+
+  sourceEntries.forEach(({ text, sourceType }) => {
+    if (!text) return;
+    const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
+
+    lines.forEach((line) => {
+      const matches = [...line.matchAll(regex)];
+      matches.forEach((match) => {
+        const item = buildCandidateItem(match, line, sourceType, options);
+        if (item) {
+          output.push(item);
+        }
+      });
+    });
+  });
+
+  const seen = new Set();
+  return output.filter((item) => {
+    const key = `${item.value_raw}|${item.context}|${item.source_type}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 40);
+}
+
+function buildEvidenceCandidates(pageData, aggregateText, sourceUrl) {
+  const sources = [
+    { text: pageData.h1Text, sourceType: 'title' },
+    { text: pageData.pageTitle, sourceType: 'title' },
+    { text: pageData.metaDescription, sourceType: 'meta_tag' },
+    { text: pageData.ogTitle, sourceType: 'meta_tag' },
+    { text: pageData.ogDescription, sourceType: 'meta_tag' },
+    { text: pageData.breadcrumbText || '', sourceType: 'breadcrumb' },
+    { text: extractUrlTokens(sourceUrl).join(' '), sourceType: 'url' },
+    { text: aggregateText, sourceType: 'body_text' },
+    { text: pageData.jsonLdPrice ? `price ${pageData.jsonLdPrice} eur` : '', sourceType: 'json_ld' }
+  ];
+
+  return {
+    prices: [
+      ...buildGenericCandidates(sources, /\b\d[\d\s.,]{2,}\s?(?:€|eur)\b/gi, {
+      unit: 'eur',
+      normalizer: (valueRaw) => normalizePriceNumber(valueRaw)
+      }),
+      ...(pageData.jsonLdPrice ? [{
+        value_raw: String(pageData.jsonLdPrice),
+        normalized_value: normalizePriceNumber(pageData.jsonLdPrice),
+        unit: 'eur',
+        context: `price ${pageData.jsonLdPrice}`,
+        source_type: 'json_ld'
+      }] : [])
+    ],
+    surfaces: buildGenericCandidates(sources, /\b\d{1,4}(?:[.,]\d{1,2})?\s?m(?:²|2)\b/gi, {
+      unit: 'm2',
+      normalizer: (valueRaw) => Number(String(valueRaw).replace(',', '.').replace(/[^\d.]/g, '')) || null
+    }),
+    rent_mentions: buildGenericCandidates(sources, /\b(loyer[s]?|revenus? locatifs?)\b[^\n]{0,120}/gi),
+    lot_mentions: buildGenericCandidates(sources, /\b(?:\d+\s+lots?|lot\s*\d+|immeuble de rapport)\b[^\n]{0,120}/gi),
+    occupancy_mentions: buildGenericCandidates(sources, /\b(lou[ée]s?|libre|vacant|occup[ée]|disponible|actuellement lou[ée]|d[ée]j[àa] lou[ée])\b[^\n]{0,120}/gi),
+    tax_mentions: buildGenericCandidates(sources, /\b(taxe\s+fonci[èe]re|fonci[èe]re|TF)\b[^\n]{0,120}/gi),
+    glazing_mentions: buildGenericCandidates(sources, /\b(simple vitrage|double vitrage|triple vitrage)\b[^\n]{0,120}/gi),
+    dpe_mentions: buildGenericCandidates(sources, /\b(DPE|classe\s+[ée]nergie|GES|classe\s+climat|[A-G]\s*\/\s*[A-G])\b[^\n]{0,120}/gi),
+    heating_mentions: buildGenericCandidates(sources, /\b(chauffage|radiateur|[ée]lectrique|gaz|collectif|individuel|pompe\s+[àa]\s+chaleur|chaudi[èe]re|inertie)\b[^\n]{0,120}/gi)
+  };
 }
 
 function extractFieldsFromText(pageData, sourceUrl) {
@@ -399,60 +549,134 @@ function extractFieldsFromText(pageData, sourceUrl) {
     pageData.fallbackText
   ].join('\n');
 
+  const extractionMeta = {
+    contract_version: '2.0-min',
+    strategy: 'heuristic_plus_evidence',
+    text_lengths: {
+      cleaned_main: (pageData.cleanedMainText || '').length,
+      fallback: (pageData.fallbackText || '').length
+    }
+  };
+
+  const candidates = {
+    dpe: buildRegexCandidates(aggregateText, /(dpe\s*[:\-]?\s*[a-g])/gi, 'dpe', 'body_text', 0.72),
+    reference_annonce: buildRegexCandidates(aggregateText, /(r[ée]f[ée]rence\s*[:#\-]?\s*[a-z0-9\-_/]+)/gi, 'reference_annonce', 'body_text', 0.78),
+    montant_loyers: buildRegexCandidates(aggregateText, /(loyer[s]?\s*[:\-]?\s*\d[\d\s]{2,}\s?€)/gi, 'montant_loyers', 'body_text', 0.7),
+    mode_chauffage: buildRegexCandidates(aggregateText, /(chauffage\s*[:\-]?\s*[a-zàâçéèêëîïôûùüÿñæœ\-\s]{3,100})/gi, 'mode_chauffage', 'body_text', 0.65),
+    ...buildEvidenceCandidates(pageData, aggregateText, sourceUrl)
+  };
+
   const descriptionText = normalizeDescriptionText(pageData.cleanedMainText || pageData.fallbackText);
 
-  updateField(fields, 'titre_annonce', pageData.h1Text || pageData.pageTitle || pageData.ogTitle, pageData.h1Text || pageData.pageTitle || pageData.ogTitle, 'found', false);
+  updateField(
+    fields,
+    'titre_annonce',
+    pageData.h1Text || pageData.pageTitle || pageData.ogTitle,
+    pageData.h1Text || pageData.pageTitle || pageData.ogTitle,
+    'found',
+    false,
+    { confidence: 0.95, sourceType: pageData.h1Text ? 'title' : 'meta_tag' }
+  );
 
   if (descriptionText) {
-    updateField(fields, 'description', descriptionText, descriptionText.slice(0, 200), 'found', false);
+    updateField(fields, 'description', descriptionText, descriptionText.slice(0, 200), 'found', false, {
+      confidence: 0.86,
+      sourceType: 'body_text'
+    });
   }
 
   const bestPrice = extractBestPrice(pageData);
   if (bestPrice) {
-    updateField(fields, 'prix_affiche', formatEuroValue(bestPrice.amount), bestPrice.source, 'found', false);
+    updateField(fields, 'prix_affiche', formatEuroValue(bestPrice.amount), bestPrice.source, 'found', false, {
+      normalizedValue: bestPrice.amount,
+      confidence: Math.min(Math.max(bestPrice.confidence / 100, 0.4), 0.99),
+      sourceType: inferSourceType(bestPrice.source, bestPrice.source)
+    });
   }
 
   const loyer = findRegexValue(aggregateText, /(loyer[s]?\s*[:\-]?\s*\d[\d\s]{2,}\s?€)/i);
   if (loyer) {
-    updateField(fields, 'montant_loyers', loyer, loyer, 'found', true);
+    const normalized = normalizePriceNumber(loyer);
+    updateField(fields, 'montant_loyers', loyer, loyer, 'found', true, {
+      normalizedValue: normalized,
+      confidence: 0.7,
+      sourceType: 'body_text'
+    });
   }
 
   const surface = findRegexValue(aggregateText, /(\d{1,4}[,.]?\d{0,2}\s?m²)/i);
   if (surface) {
-    updateField(fields, 'mesures_surfaces', surface, surface, 'found', true);
+    const normalized = Number(String(surface).replace(',', '.').replace(/[^\d.]/g, '')) || null;
+    updateField(fields, 'mesures_surfaces', surface, surface, 'found', true, {
+      normalizedValue: normalized,
+      confidence: 0.72,
+      sourceType: 'body_text'
+    });
   }
 
   const lots = findRegexValue(aggregateText, /(\d+\s+lots?)/i);
   if (lots) {
-    updateField(fields, 'nombre_lots', lots, lots, 'found', true);
+    const normalized = Number((lots.match(/\d+/) || [])[0]) || null;
+    updateField(fields, 'nombre_lots', lots, lots, 'found', true, {
+      normalizedValue: normalized,
+      confidence: 0.68,
+      sourceType: 'body_text'
+    });
   }
 
   const taxe = findRegexValue(aggregateText, /(taxe fonci[eè]re\s*[:\-]?\s*\d[\d\s]{1,}\s?€?)/i);
   if (taxe) {
-    updateField(fields, 'taxe_fonciere', taxe, taxe, 'found', true);
+    updateField(fields, 'taxe_fonciere', taxe, taxe, 'found', true, {
+      normalizedValue: normalizePriceNumber(taxe),
+      confidence: 0.71,
+      sourceType: 'body_text'
+    });
   }
 
   const dpe = findRegexValue(aggregateText, /(DPE\s*[:\-]?\s*[A-G])/i);
   if (dpe) {
-    updateField(fields, 'dpe', dpe, dpe, 'found', true);
+    updateField(fields, 'dpe', dpe, dpe, 'found', true, {
+      normalizedValue: (dpe.match(/[A-G]/i) || [null])[0],
+      confidence: 0.75,
+      sourceType: 'body_text'
+    });
   }
 
   const chauffage = extractHeatingFromText(descriptionText || aggregateText);
   if (chauffage) {
-    updateField(fields, 'mode_chauffage', chauffage, chauffage, 'found', true);
+    updateField(fields, 'mode_chauffage', chauffage, chauffage, 'found', true, {
+      confidence: 0.66,
+      sourceType: 'body_text'
+    });
   }
 
-  const reference = findRegexValue(aggregateText, /(r[eé]f[eé]rence\s*[:#\-]?\s*[A-Za-z0-9\-_/]+)/i);
+  const referenceFromUrl = extractReferenceFromUrl(sourceUrl);
+  const reference = findRegexValue(aggregateText, /(r[ée]f[ée]rence\s*[:#\-]?\s*[A-Za-z0-9\-_/]+)/i) || referenceFromUrl;
   if (reference) {
-    updateField(fields, 'reference_annonce', reference, reference, 'found', true);
+    const sourceType = reference === referenceFromUrl ? 'url' : 'body_text';
+    updateField(fields, 'reference_annonce', reference, reference, 'found', true, {
+      confidence: sourceType === 'url' ? 0.62 : 0.8,
+      sourceType
+    });
+    if (sourceType === 'url') {
+      candidates.reference_annonce.push({
+        field: 'reference_annonce',
+        value: reference,
+        source_text: sourceUrl,
+        source_type: 'url',
+        confidence: 0.62
+      });
+    }
   }
 
   const location = extractLocation(pageData);
   if (location && location.value) {
-    updateField(fields, 'situation_geographique', location.value, location.source, 'found', false);
+    updateField(fields, 'situation_geographique', location.value, location.source, 'found', false, {
+      confidence: 0.83,
+      sourceType: 'body_text'
+    });
   }
 
-  // Heuristique ciblée: on évite le faux positif "honoraires agence".
   const agencySignals = [
     /iad\s*france/i,
     /century\s*21/i,
@@ -465,23 +689,46 @@ function extractFieldsFromText(pageData, sourceUrl) {
   if (agencyLine) {
     const agencyName = agencySignals.find((regex) => regex.test(agencyLine));
     const normalizedAgency = agencyName ? agencyLine.match(agencyName)?.[0] : null;
-    updateField(fields, 'agence_annonceur', normalizedAgency || agencyLine, agencyLine, 'inferred', true);
+    updateField(fields, 'agence_annonceur', normalizedAgency || agencyLine, agencyLine, 'inferred', true, {
+      confidence: 0.74,
+      sourceType: 'body_text'
+    });
   } else if (/iadfrance\.fr/i.test(sourceUrl)) {
-    updateField(fields, 'agence_annonceur', 'iad France', 'Domaine iadfrance.fr', 'inferred', true);
+    updateField(fields, 'agence_annonceur', 'iad France', 'Domaine iadfrance.fr', 'inferred', true, {
+      confidence: 0.69,
+      sourceType: 'url'
+    });
   }
 
   const typeBien = findRegexValue(aggregateText, /(appartement|maison|immeuble|studio|terrain|local commercial)/i);
   if (typeBien) {
-    updateField(fields, 'type_bien', typeBien, typeBien, 'inferred', true);
+    updateField(fields, 'type_bien', typeBien, typeBien, 'inferred', true, {
+      confidence: 0.82,
+      sourceType: 'body_text'
+    });
   }
 
   return {
     fields,
-    descriptionText
+    descriptionText,
+    candidates,
+    extractionMeta,
+    rawSignals: {
+      page_title: pageData.pageTitle || '',
+      h1: pageData.h1Text || '',
+      meta_description: pageData.metaDescription || '',
+      og_title: pageData.ogTitle || '',
+      og_description: pageData.ogDescription || '',
+      json_ld_price: pageData.jsonLdPrice || null,
+      cleaned_main_text: pageData.cleanedMainText || '',
+      fallback_text: pageData.fallbackText || '',
+      url_tokens: extractUrlTokens(sourceUrl),
+      breadcrumb_text: pageData.breadcrumbText || ''
+    }
   };
 }
 
-function buildResponse({ requestId, sourceUrl, pageData, fields, images, errors, descriptionText }) {
+function buildResponse({ requestId, sourceUrl, pageData, fields, images, errors, descriptionText, candidates, extractionMeta, rawSignals }) {
   const completeness = buildCompleteness(fields);
   const hasFatalErrors = errors.some((e) => e.code === 'EXTRACTION_FAILED' || e.code === 'NAVIGATION_FAILED');
   const hasMissing = completeness.missing_fields.length > 0;
@@ -508,8 +755,11 @@ function buildResponse({ requestId, sourceUrl, pageData, fields, images, errors,
     fields,
     completeness,
     raw: {
-      description_text: descriptionText || ''
+      description_text: descriptionText || '',
+      ...rawSignals
     },
+    candidates,
+    extraction_metadata: extractionMeta,
     errors
   };
 }
@@ -538,7 +788,7 @@ async function extractListing(payload) {
     await tryCarouselInteractions(page);
 
     const pageData = await collectPageData(page);
-    const { fields, descriptionText } = extractFieldsFromText(pageData, payload.url);
+    const { fields, descriptionText, candidates, extractionMeta, rawSignals } = extractFieldsFromText(pageData, payload.url);
 
     if (!pageData.pageTitle) {
       errors.push({
@@ -554,7 +804,10 @@ async function extractListing(payload) {
       fields,
       images: pageData.imageUrls,
       errors,
-      descriptionText
+      descriptionText,
+      candidates,
+      extractionMeta,
+      rawSignals
     });
 
     if (payload.debug) {
@@ -602,7 +855,40 @@ async function extractListing(payload) {
         completion_score: 0
       },
       raw: {
-        description_text: ''
+        description_text: '',
+        page_title: '',
+        h1: '',
+        meta_description: '',
+        og_title: '',
+        og_description: '',
+        json_ld_price: null,
+        cleaned_main_text: '',
+        fallback_text: '',
+        url_tokens: [],
+        breadcrumb_text: ''
+      },
+      candidates: {
+        dpe: [],
+        reference_annonce: [],
+        montant_loyers: [],
+        mode_chauffage: [],
+        prices: [],
+        surfaces: [],
+        rent_mentions: [],
+        lot_mentions: [],
+        occupancy_mentions: [],
+        tax_mentions: [],
+        glazing_mentions: [],
+        dpe_mentions: [],
+        heating_mentions: []
+      },
+      extraction_metadata: {
+        contract_version: '2.0-min',
+        strategy: 'heuristic_plus_evidence',
+        text_lengths: {
+          cleaned_main: 0,
+          fallback: 0
+        }
       },
       errors: [
         {
