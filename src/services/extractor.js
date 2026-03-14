@@ -269,9 +269,9 @@ async function collectPageData(page) {
     const imageUrls = [];
     const seen = new Set();
     imageCandidates.forEach((candidate) => {
-      const normalizedUrl = normalizeImageUrl(candidate.url);
+      const normalizedUrl = absoluteUrl(candidate.url);
       const withUrl = { ...candidate, url: normalizedUrl };
-      if (!normalizedUrl || !isLikelyPropertyImage(withUrl)) return;
+      if (!normalizedUrl || !isLikelyUsefulImage(withUrl)) return;
       if (seen.has(normalizedUrl)) return;
       seen.add(normalizedUrl);
       imageUrls.push(normalizedUrl);
