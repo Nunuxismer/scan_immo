@@ -372,6 +372,25 @@ async function collectPageData(page) {
     const mainTextBlocks = collectText(mainContainer).slice(0, 700);
     const bodyTextBlocks = collectText(document.body).slice(0, 1000);
 
+    const breadcrumbSelectors = [
+      'nav[aria-label*=\"breadcrumb\" i]',
+      '[role=\"navigation\"][aria-label*=\"fil\" i]',
+      '[class*=\"breadcrumb\" i]',
+      '[data-testid*=\"breadcrumb\" i]'
+    ];
+
+    let breadcrumbText = '';
+    for (const selector of breadcrumbSelectors) {
+      const node = document.querySelector(selector);
+      if (node) {
+        const nodeText = (node.innerText || '').replace(/\s+/g, ' ').trim();
+        if (nodeText) {
+          breadcrumbText = nodeText;
+          break;
+        }
+      }
+    }
+
     return {
       pageTitle: title,
       h1Text,
@@ -381,6 +400,7 @@ async function collectPageData(page) {
       jsonLdPrice,
       cleanedMainText: mainTextBlocks.join('\n'),
       fallbackText: bodyTextBlocks.join('\n'),
+      breadcrumbText,
       imageUrls: imageUrls.slice(0, maxImages),
       imageFilterDebug
     };
@@ -418,6 +438,105 @@ function buildRegexCandidates(text, regex, field, sourceType, confidence = 0.6) 
   })).filter((item) => item.value);
 }
 
+
+function extractUrlTokens(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+    const seen = new Set();
+
+    return decodeURIComponent(parsed.pathname || '')
+      .toLowerCase()
+      .split(/[\s\/_-]+/g)
+      .map((token) => token.trim())
+      .filter((token) => token && !seen.has(token) && (seen.add(token) || true));
+  } catch (_error) {
+    return [];
+  }
+}
+
+function buildCandidateItem(match, contextText, sourceType, options = {}) {
+  const valueRaw = (match?.[0] || '').trim();
+  if (!valueRaw) return null;
+
+  const normalizedValue = options.normalizer ? options.normalizer(valueRaw, match) : null;
+
+  return {
+    value_raw: valueRaw,
+    normalized_value: normalizedValue,
+    unit: options.unit || null,
+    context: (contextText || '').slice(0, 220),
+    source_type: sourceType
+  };
+}
+
+function buildGenericCandidates(sourceEntries, regex, options = {}) {
+  const output = [];
+
+  sourceEntries.forEach(({ text, sourceType }) => {
+    if (!text) return;
+    const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
+
+    lines.forEach((line) => {
+      const matches = [...line.matchAll(regex)];
+      matches.forEach((match) => {
+        const item = buildCandidateItem(match, line, sourceType, options);
+        if (item) {
+          output.push(item);
+        }
+      });
+    });
+  });
+
+  const seen = new Set();
+  return output.filter((item) => {
+    const key = `${item.value_raw}|${item.context}|${item.source_type}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 40);
+}
+
+function buildEvidenceCandidates(pageData, aggregateText, sourceUrl) {
+  const sources = [
+    { text: pageData.h1Text, sourceType: 'title' },
+    { text: pageData.pageTitle, sourceType: 'title' },
+    { text: pageData.metaDescription, sourceType: 'meta_tag' },
+    { text: pageData.ogTitle, sourceType: 'meta_tag' },
+    { text: pageData.ogDescription, sourceType: 'meta_tag' },
+    { text: pageData.breadcrumbText || '', sourceType: 'breadcrumb' },
+    { text: extractUrlTokens(sourceUrl).join(' '), sourceType: 'url' },
+    { text: aggregateText, sourceType: 'body_text' },
+    { text: pageData.jsonLdPrice ? `price ${pageData.jsonLdPrice} eur` : '', sourceType: 'json_ld' }
+  ];
+
+  return {
+    prices: [
+      ...buildGenericCandidates(sources, /\b\d[\d\s.,]{2,}\s?(?:€|eur)\b/gi, {
+      unit: 'eur',
+      normalizer: (valueRaw) => normalizePriceNumber(valueRaw)
+      }),
+      ...(pageData.jsonLdPrice ? [{
+        value_raw: String(pageData.jsonLdPrice),
+        normalized_value: normalizePriceNumber(pageData.jsonLdPrice),
+        unit: 'eur',
+        context: `price ${pageData.jsonLdPrice}`,
+        source_type: 'json_ld'
+      }] : [])
+    ],
+    surfaces: buildGenericCandidates(sources, /\b\d{1,4}(?:[.,]\d{1,2})?\s?m(?:²|2)\b/gi, {
+      unit: 'm2',
+      normalizer: (valueRaw) => Number(String(valueRaw).replace(',', '.').replace(/[^\d.]/g, '')) || null
+    }),
+    rent_mentions: buildGenericCandidates(sources, /\b(loyer[s]?|revenus? locatifs?)\b[^\n]{0,120}/gi),
+    lot_mentions: buildGenericCandidates(sources, /\b(?:\d+\s+lots?|lot\s*\d+|immeuble de rapport)\b[^\n]{0,120}/gi),
+    occupancy_mentions: buildGenericCandidates(sources, /\b(lou[ée]s?|libre|vacant|occup[ée]|disponible|actuellement lou[ée]|d[ée]j[àa] lou[ée])\b[^\n]{0,120}/gi),
+    tax_mentions: buildGenericCandidates(sources, /\b(taxe\s+fonci[èe]re|fonci[èe]re|TF)\b[^\n]{0,120}/gi),
+    glazing_mentions: buildGenericCandidates(sources, /\b(simple vitrage|double vitrage|triple vitrage)\b[^\n]{0,120}/gi),
+    dpe_mentions: buildGenericCandidates(sources, /\b(DPE|classe\s+[ée]nergie|GES|classe\s+climat|[A-G]\s*\/\s*[A-G])\b[^\n]{0,120}/gi),
+    heating_mentions: buildGenericCandidates(sources, /\b(chauffage|radiateur|[ée]lectrique|gaz|collectif|individuel|pompe\s+[àa]\s+chaleur|chaudi[èe]re|inertie)\b[^\n]{0,120}/gi)
+  };
+}
+
 function extractFieldsFromText(pageData, sourceUrl) {
   const fields = createInitialFields();
   const aggregateText = [
@@ -443,7 +562,8 @@ function extractFieldsFromText(pageData, sourceUrl) {
     dpe: buildRegexCandidates(aggregateText, /(dpe\s*[:\-]?\s*[a-g])/gi, 'dpe', 'body_text', 0.72),
     reference_annonce: buildRegexCandidates(aggregateText, /(r[ée]f[ée]rence\s*[:#\-]?\s*[a-z0-9\-_/]+)/gi, 'reference_annonce', 'body_text', 0.78),
     montant_loyers: buildRegexCandidates(aggregateText, /(loyer[s]?\s*[:\-]?\s*\d[\d\s]{2,}\s?€)/gi, 'montant_loyers', 'body_text', 0.7),
-    mode_chauffage: buildRegexCandidates(aggregateText, /(chauffage\s*[:\-]?\s*[a-zàâçéèêëîïôûùüÿñæœ\-\s]{3,100})/gi, 'mode_chauffage', 'body_text', 0.65)
+    mode_chauffage: buildRegexCandidates(aggregateText, /(chauffage\s*[:\-]?\s*[a-zàâçéèêëîïôûùüÿñæœ\-\s]{3,100})/gi, 'mode_chauffage', 'body_text', 0.65),
+    ...buildEvidenceCandidates(pageData, aggregateText, sourceUrl)
   };
 
   const descriptionText = normalizeDescriptionText(pageData.cleanedMainText || pageData.fallbackText);
@@ -601,7 +721,9 @@ function extractFieldsFromText(pageData, sourceUrl) {
       og_description: pageData.ogDescription || '',
       json_ld_price: pageData.jsonLdPrice || null,
       cleaned_main_text: pageData.cleanedMainText || '',
-      fallback_text: pageData.fallbackText || ''
+      fallback_text: pageData.fallbackText || '',
+      url_tokens: extractUrlTokens(sourceUrl),
+      breadcrumb_text: pageData.breadcrumbText || ''
     }
   };
 }
@@ -741,13 +863,24 @@ async function extractListing(payload) {
         og_description: '',
         json_ld_price: null,
         cleaned_main_text: '',
-        fallback_text: ''
+        fallback_text: '',
+        url_tokens: [],
+        breadcrumb_text: ''
       },
       candidates: {
         dpe: [],
         reference_annonce: [],
         montant_loyers: [],
-        mode_chauffage: []
+        mode_chauffage: [],
+        prices: [],
+        surfaces: [],
+        rent_mentions: [],
+        lot_mentions: [],
+        occupancy_mentions: [],
+        tax_mentions: [],
+        glazing_mentions: [],
+        dpe_mentions: [],
+        heating_mentions: []
       },
       extraction_metadata: {
         contract_version: '2.0-min',
