@@ -525,7 +525,12 @@ function buildEvidenceCandidates(pageData, aggregateText, sourceUrl) {
     ],
     surfaces: buildGenericCandidates(sources, /\b\d{1,4}(?:[.,]\d{1,2})?\s?m(?:²|2)\b/gi, {
       unit: 'm2',
-      normalizer: (valueRaw) => Number(String(valueRaw).replace(',', '.').replace(/[^\d.]/g, '')) || null
+      normalizer: (valueRaw) => Number(
+        String(valueRaw)
+          .replace(/m(?:²|2)/gi, '')
+          .replace(',', '.')
+          .replace(/[^\d.]/g, '')
+      ) || null
     }),
     rent_mentions: buildGenericCandidates(sources, /\b(loyer[s]?|revenus? locatifs?)\b[^\n]{0,120}/gi),
     lot_mentions: buildGenericCandidates(sources, /\b(?:\d+\s+lots?|lot\s*\d+|immeuble de rapport)\b[^\n]{0,120}/gi),
