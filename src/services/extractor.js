@@ -64,9 +64,7 @@ function formatEuroValue(amount) {
 }
 
 function extractBestPrice(pageData) {
-  // NOTE: ce bloc est la version consolidée retenue lors de la résolution de conflits.
-  // Heuristique ciblée: privilégier le prix lié au bien (pas loyer/charges/honoraires)
-  // 1) JSON-LD price, 2) lignes contenant "prix", 3) fallback max montant raisonnable.
+  // NOTE: heuristique prudente : mieux vaut "missing" qu'un faux prix (taxe, charges, loyer).
   const candidates = [];
 
   if (pageData.jsonLdPrice) {
@@ -81,11 +79,36 @@ function extractBestPrice(pageData) {
     }
   }
 
-  const lines = pageData.cleanedMainText.split('\n').map((line) => line.trim()).filter(Boolean);
+  const textSources = [
+    pageData.h1Text,
+    pageData.pageTitle,
+    pageData.metaDescription,
+    pageData.ogTitle,
+    pageData.ogDescription,
+    pageData.embeddedJsonText,
+    pageData.cleanedMainText,
+    pageData.fallbackText
+  ].filter(Boolean);
+
+  const lines = textSources
+    .flatMap((text) => String(text).split('\n'))
+    .map((line) => line.trim())
+    .filter(Boolean);
+
   const moneyRegex = /(\d[\d\s]{2,})\s?€/g;
-  const negativeContextRegex = /(loyer|charges|charge|honoraires|mois|mensuel|mensuelle|frais|d[ée]p[oô]t)/i;
+  const numericPriceKeyRegex = /\b(?:lastmailalertprice|price|prix)\b\s*[:\-]?\s*(\d{4,})\b/i;
+  const negativeContextRegex = /(loyer|lou[ée]|charges|charge|honoraires|mois|mensuel|mensuelle|frais|d[ée]p[oô]t|taxe\s+fonci[èe]re|fonci[èe]re|copropri[ée]t[ée]|tf)/i;
+  const positiveContextRegex = /(\bprix\b|\bvente\b|\bvendre\b|\bacheter\b|\bachat\b|\bappartement\b|\bmaison\b|\bstudio\b|\bimmeuble\b)/i;
 
   lines.forEach((line) => {
+    const numericPriceKeyMatch = line.match(numericPriceKeyRegex);
+    if (numericPriceKeyMatch && !negativeContextRegex.test(line)) {
+      const amount = normalizePriceNumber(numericPriceKeyMatch[1]);
+      if (amount) {
+        candidates.push({ amount, text: numericPriceKeyMatch[0], confidence: 85, source: line });
+      }
+    }
+
     const matches = [...line.matchAll(moneyRegex)];
     if (!matches.length) return;
 
@@ -94,12 +117,14 @@ function extractBestPrice(pageData) {
       if (!amount) return;
 
       let confidence = 20;
-      if (/\bprix\b/i.test(line)) confidence += 40;
-      if (/\bvente\b|\bacheter\b|\bachat\b/i.test(line)) confidence += 10;
-      if (negativeContextRegex.test(line)) confidence -= 40;
-      if (amount < 10000) confidence -= 20;
+      if (positiveContextRegex.test(line)) confidence += 30;
+      if (negativeContextRegex.test(line)) confidence -= 80;
+      if (amount < 10000) confidence -= 30;
+      if (amount < 100000) confidence -= 10;
 
-      candidates.push({ amount, text: m[0], confidence, source: line });
+      if (confidence > 0) {
+        candidates.push({ amount, text: m[0], confidence, source: line });
+      }
     });
   });
 
@@ -127,9 +152,13 @@ function normalizeDescriptionText(rawText) {
 function extractHeatingFromText(text) {
   if (!text) return null;
 
+  const explicitMode = text.match(/\bchauffage\s*[:\-]?\s*(collectif|individuel|gaz|électrique|electrique|fioul|bois|pompe\s+[àa]\s+chaleur)\b/i);
+  if (explicitMode && explicitMode[1]) {
+    return explicitMode[1].replace(/\s+/g, ' ').trim();
+  }
+
   const patterns = [
     /(radiateurs?\s+[a-zàâçéèêëîïôûùüÿñæœ\-\s]{3,80})/i,
-    /(chauffage\s*[:\-]?\s*[a-zàâçéèêëîïôûùüÿñæœ\-\s]{3,100})/i,
     /(pompe\s+[a-zàâçéèêëîïôûùüÿñæœ\-\s]{2,80})/i
   ];
 
@@ -357,6 +386,53 @@ async function collectPageData(page) {
       if (jsonLdPrice) break;
     }
 
+    const embeddedJsonLines = [];
+    const embeddedJsonSeen = new Set();
+    const embeddedJsonKeyRegex = /(price|prix|rent|loyer|tax|fonci|charges|dpe|ges|energy|energie|climat|climate|heating|chauff|glazing|vitrage|surface|area|reference|ref|city|ville|rooms|pieces)/i;
+    const embeddedJsonValueRegex = /(€|eur|m²|m2|double vitrage|simple vitrage|triple vitrage|collectif|individuel|dpe|ges|taxe foncière|charges|chauffage)/i;
+
+    const pushEmbeddedJsonLine = (line) => {
+      const normalized = (line || '').replace(/\s+/g, ' ').trim();
+      if (!normalized || normalized.length < 4 || normalized.length > 220) return;
+      if (embeddedJsonSeen.has(normalized)) return;
+      embeddedJsonSeen.add(normalized);
+      embeddedJsonLines.push(normalized);
+    };
+
+    const walkEmbeddedJson = (value, path = []) => {
+      if (embeddedJsonLines.length >= 120) return;
+
+      if (Array.isArray(value)) {
+        value.slice(0, 50).forEach((item, index) => walkEmbeddedJson(item, [...path, `[${index}]`]));
+        return;
+      }
+
+      if (value && typeof value === 'object') {
+        Object.entries(value).slice(0, 200).forEach(([key, child]) => {
+          const nextPath = [...path, key];
+          const pathText = nextPath.join('.');
+          if (child && typeof child !== 'object') {
+            const rendered = `${pathText}: ${String(child)}`;
+            if (embeddedJsonKeyRegex.test(pathText) || embeddedJsonValueRegex.test(String(child))) {
+              pushEmbeddedJsonLine(rendered);
+            }
+          }
+          walkEmbeddedJson(child, nextPath);
+        });
+      }
+    };
+
+    Array.from(document.querySelectorAll('script[type="application/json"]'))
+      .slice(0, 20)
+      .forEach((script) => {
+        try {
+          const parsed = JSON.parse(script.textContent || '{}');
+          walkEmbeddedJson(parsed);
+        } catch (_error) {
+          // ignore malformed embedded JSON
+        }
+      });
+
     // Heuristique bruit réduit: on priorise la zone principale d'annonce.
     const mainContainer =
       document.querySelector('main') ||
@@ -453,6 +529,7 @@ async function collectPageData(page) {
       ogTitle,
       ogDescription,
       jsonLdPrice,
+      embeddedJsonText: embeddedJsonLines.join('\n'),
       cleanedMainText: mainTextBlocks.join('\n'),
       fallbackText: bodyTextBlocks.join('\n'),
       breadcrumbText,
@@ -531,15 +608,24 @@ function buildGenericCandidates(sourceEntries, regex, options = {}) {
     if (!text) return;
     const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
 
-    lines.forEach((line) => {
-      const matches = [...line.matchAll(regex)];
-      matches.forEach((match) => {
-        const item = buildCandidateItem(match, line, sourceType, options);
-        if (item) {
-          output.push(item);
-        }
-      });
+    const contexts = [];
+    lines.forEach((line, index) => {
+      contexts.push(line);
+      contexts.push(lines.slice(index, index + 2).join(' '));
+      contexts.push(lines.slice(index, index + 3).join(' '));
     });
+
+    contexts
+      .filter(Boolean)
+      .forEach((contextText) => {
+        const matches = [...contextText.matchAll(regex)];
+        matches.forEach((match) => {
+          const item = buildCandidateItem(match, contextText, sourceType, options);
+          if (item) {
+            output.push(item);
+          }
+        });
+      });
   });
 
   const seen = new Set();
@@ -560,6 +646,7 @@ function buildEvidenceCandidates(pageData, aggregateText, sourceUrl) {
     { text: pageData.ogDescription, sourceType: 'meta_tag' },
     { text: pageData.breadcrumbText || '', sourceType: 'breadcrumb' },
     { text: extractUrlTokens(sourceUrl).join(' '), sourceType: 'url' },
+    { text: pageData.embeddedJsonText || '', sourceType: 'embedded_json' },
     { text: aggregateText, sourceType: 'body_text' },
     { text: pageData.jsonLdPrice ? `price ${pageData.jsonLdPrice} eur` : '', sourceType: 'json_ld' }
   ];
@@ -605,6 +692,7 @@ function extractFieldsFromText(pageData, sourceUrl) {
     pageData.ogTitle,
     pageData.metaDescription,
     pageData.ogDescription,
+    pageData.embeddedJsonText,
     pageData.cleanedMainText,
     pageData.fallbackText
   ].join('\n');
@@ -693,16 +781,17 @@ function extractFieldsFromText(pageData, sourceUrl) {
     });
   }
 
-  const dpe = findRegexValue(aggregateText, /(DPE\s*[:\-]?\s*[A-G])/i);
+  const dpe = findRegexValue(aggregateText, /((?:DPE(?:Class)?|EnergyConsumptionClass)\s*[:\-]?\s*[A-G])/i);
   if (dpe) {
-    updateField(fields, 'dpe', dpe, dpe, 'found', true, {
-      normalizedValue: (dpe.match(/[A-G]/i) || [null])[0],
+    const dpeClass = (dpe.match(/(?:DPE(?:Class)?|EnergyConsumptionClass)\s*[:\-]?\s*([A-G])/i) || [null, null])[1];
+    updateField(fields, 'dpe', dpeClass || dpe, dpeClass || dpe, 'found', true, {
+      normalizedValue: dpeClass || null,
       confidence: 0.75,
       sourceType: 'body_text'
     });
   }
 
-  const chauffage = extractHeatingFromText(descriptionText || aggregateText);
+  const chauffage = extractHeatingFromText(aggregateText || descriptionText);
   if (chauffage) {
     updateField(fields, 'mode_chauffage', chauffage, chauffage, 'found', true, {
       confidence: 0.66,
