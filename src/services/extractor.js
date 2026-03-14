@@ -365,12 +365,67 @@ async function collectPageData(page) {
       document.querySelector('[class*="listing" i]') ||
       document.body;
 
-    const collectText = (root) => Array.from(root.querySelectorAll('h1, h2, h3, p, li'))
-      .map((el) => (el.innerText || '').trim())
-      .filter(Boolean);
+    const isVisibleTextNode = (el) => {
+      if (!el || !(el instanceof Element)) return false;
+      const style = window.getComputedStyle(el);
+      if (!style) return true;
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (style.opacity === '0') return false;
+      return true;
+    };
 
-    const mainTextBlocks = collectText(mainContainer).slice(0, 700);
-    const bodyTextBlocks = collectText(document.body).slice(0, 1000);
+    const hasNoisyContext = (el) => {
+      if (!el || !(el instanceof Element)) return false;
+      const nearest = el.closest('header, footer, nav, form, aside, dialog, [role="dialog"], [aria-live], [class*="chat" i], [id*="chat" i], [class*="cookie" i], [id*="cookie" i], [class*="newsletter" i], [id*="newsletter" i], [class*="assistant" i], [id*="assistant" i]');
+      if (nearest) return true;
+
+      const context = `${el.className || ''} ${el.id || ''}`.toLowerCase();
+      return /(cookie|consent|assistant|chatbot|messenger|newsletter|cta|breadcrumb|footer|header|menu)/i.test(context);
+    };
+
+    const normalizeLine = (value) => (value || '').replace(/\s+/g, ' ').trim();
+
+    const collectText = (root, maxBlocks) => {
+      if (!root) return [];
+
+      const seen = new Set();
+      const selected = [];
+      const pushUnique = (line) => {
+        const normalized = normalizeLine(line);
+        if (!normalized || normalized.length < 2) return;
+        if (seen.has(normalized)) return;
+        seen.add(normalized);
+        selected.push(normalized);
+      };
+
+      const baseSelectors = 'h1, h2, h3, h4, p, li, dt, dd, td, th, summary';
+      Array.from(root.querySelectorAll(baseSelectors)).forEach((el) => {
+        if (!isVisibleTextNode(el) || hasNoisyContext(el)) return;
+        pushUnique(el.innerText || '');
+      });
+
+      // Additif générique: capter le texte des sections structurées (souvent caractéristiques / diagnostics).
+      const headingNodes = Array.from(root.querySelectorAll('h2, h3, h4, strong, summary')).slice(0, 80);
+      headingNodes.forEach((heading) => {
+        if (!isVisibleTextNode(heading) || hasNoisyContext(heading)) return;
+        const headingText = normalizeLine(heading.innerText || '');
+        if (!headingText || headingText.length > 120) return;
+
+        const container = heading.closest('section, article, details, [role="region"], [class*="section" i], [class*="detail" i], [class*="feature" i], [class*="caracter" i], [class*="diagnostic" i], div, ul') || heading.parentElement;
+        if (!container || hasNoisyContext(container) || !isVisibleTextNode(container)) return;
+
+        const containerText = normalizeLine(container.innerText || '');
+        if (!containerText || containerText.length < 25) return;
+        if (containerText.length > 1200) return;
+
+        pushUnique(containerText);
+      });
+
+      return selected.slice(0, maxBlocks);
+    };
+
+    const mainTextBlocks = collectText(mainContainer, 900);
+    const bodyTextBlocks = collectText(document.body, 1300);
 
     const breadcrumbSelectors = [
       'nav[aria-label*=\"breadcrumb\" i]',
