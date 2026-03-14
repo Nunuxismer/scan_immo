@@ -23,8 +23,11 @@ const FIELD_KEYS = [
 function createEmptyField() {
   return {
     value: null,
+    normalized_value: null,
     status: 'missing',
+    confidence: null,
     source_text: null,
+    source_type: null,
     needs_review: true
   };
 }
@@ -36,7 +39,14 @@ function createInitialFields() {
   }, {});
 }
 
-function updateField(fields, key, value, sourceText, status = 'found', needsReview = true) {
+function normalizeConfidence(confidence) {
+  if (!Number.isFinite(confidence)) return null;
+  if (confidence < 0) return 0;
+  if (confidence > 1) return 1;
+  return Math.round(confidence * 100) / 100;
+}
+
+function updateField(fields, key, value, sourceText, status = 'found', needsReview = true, options = {}) {
   if (!fields[key]) {
     return;
   }
@@ -50,8 +60,11 @@ function updateField(fields, key, value, sourceText, status = 'found', needsRevi
 
   fields[key] = {
     value: String(value).trim(),
+    normalized_value: options.normalizedValue ?? null,
     status,
+    confidence: normalizeConfidence(options.confidence),
     source_text: sourceText ? String(sourceText).trim() : null,
+    source_type: options.sourceType || null,
     needs_review: needsReview
   };
 }
