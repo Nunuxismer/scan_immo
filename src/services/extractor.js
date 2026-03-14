@@ -191,12 +191,12 @@ async function collectPageData(page) {
       }
     };
 
-    const isLikelyPropertyImage = (item) => {
-      if (!item.url) return false;
+    const getImageRejectionReason = (item) => {
+      if (!item.url) return 'missing_url';
       const lowered = item.url.toLowerCase();
       const context = `${item.alt || ''} ${item.className || ''} ${item.parentClass || ''}`.toLowerCase();
 
-      if (lowered.startsWith('data:')) return false;
+      if (lowered.startsWith('data:')) return 'data_url';
 
       const blockedUrlTokens = [
         'maps.googleapis.com/maps/vt',
@@ -218,20 +218,43 @@ async function collectPageData(page) {
         'placeholder'
       ];
 
-      if (blockedUrlTokens.some((token) => lowered.includes(token))) return false;
-      if (/avatar|profil|profile|agent|conseiller|author/.test(context)) return false;
+      if (blockedUrlTokens.some((token) => lowered.includes(token))) return 'blocked_token';
+      if (/avatar|profil|profile|agent|conseiller|author/.test(context)) return 'blocked_context';
 
-      if (item.width && item.height && item.width < 180 && item.height < 180) return false;
+      if (item.width && item.height && item.width < 180 && item.height < 180) return 'tiny_image';
 
       const hasKnownImageExt = /\.(jpg|jpeg|png|webp|avif)(\?|$)/i.test(lowered);
       const hasExplicitNonImageExt = /\.(svg|gif|ico|woff2?|ttf|eot|mp4|webm|pdf)(\?|$)/i.test(lowered);
-      if (hasExplicitNonImageExt) return false;
+      if (hasExplicitNonImageExt) return 'non_image_extension';
 
       // Cas fréquent M-OI: on garde explicitement les photos métier du dossier properties.
-      if (lowered.includes('/img/properties/')) return true;
+      if (lowered.includes('/img/properties/')) return null;
 
-      return hasKnownImageExt || /\/photos?\//i.test(lowered) || /\/images?\//i.test(lowered);
+      // Garde plus souple: certains sites (M-OI) servent des photos via /uploads/ sans extension explicite.
+      let sameDomainPath = '';
+      try {
+        const parsed = new URL(item.url);
+        const currentHost = window.location.hostname.replace(/^www\./, '');
+        const itemHost = parsed.hostname.replace(/^www\./, '');
+        if (itemHost === currentHost) {
+          sameDomainPath = parsed.pathname.toLowerCase();
+        }
+      } catch (_error) {
+        return 'invalid_url';
+      }
+
+      if (sameDomainPath && /\/(uploads|upload|media|photos?|images?)\//i.test(sameDomainPath)) {
+        return null;
+      }
+
+      if (hasKnownImageExt || /\/photos?\//i.test(lowered) || /\/images?\//i.test(lowered)) {
+        return null;
+      }
+
+      return 'not_photo_like';
     };
+
+    const isLikelyPropertyImage = (item) => getImageRejectionReason(item) === null;
 
     const imageCandidates = [];
 
@@ -268,13 +291,42 @@ async function collectPageData(page) {
 
     const imageUrls = [];
     const seen = new Set();
+    const imageFilterDebug = {
+      total_candidates: imageCandidates.length,
+      kept_count: 0,
+      rejected_count: 0,
+      rejected_reasons: {},
+      kept_samples: [],
+      rejected_samples: []
+    };
+
     imageCandidates.forEach((candidate) => {
-      const normalizedUrl = absoluteUrl(candidate.url);
+      const normalizedUrl = normalizeImageUrl(candidate.url);
       const withUrl = { ...candidate, url: normalizedUrl };
-      if (!normalizedUrl || !isLikelyUsefulImage(withUrl)) return;
-      if (seen.has(normalizedUrl)) return;
+      const rejectionReason = getImageRejectionReason(withUrl);
+
+      if (!normalizedUrl || rejectionReason !== null) {
+        imageFilterDebug.rejected_count += 1;
+        const reasonKey = rejectionReason || 'invalid_url';
+        imageFilterDebug.rejected_reasons[reasonKey] = (imageFilterDebug.rejected_reasons[reasonKey] || 0) + 1;
+        if (normalizedUrl && imageFilterDebug.rejected_samples.length < 20) {
+          imageFilterDebug.rejected_samples.push({ url: normalizedUrl, reason: reasonKey });
+        }
+        return;
+      }
+
+      if (seen.has(normalizedUrl)) {
+        imageFilterDebug.rejected_count += 1;
+        imageFilterDebug.rejected_reasons.duplicate = (imageFilterDebug.rejected_reasons.duplicate || 0) + 1;
+        return;
+      }
+
       seen.add(normalizedUrl);
       imageUrls.push(normalizedUrl);
+      imageFilterDebug.kept_count += 1;
+      if (imageFilterDebug.kept_samples.length < 20) {
+        imageFilterDebug.kept_samples.push(normalizedUrl);
+      }
     });
 
     const title = document.title || '';
@@ -329,7 +381,8 @@ async function collectPageData(page) {
       jsonLdPrice,
       cleanedMainText: mainTextBlocks.join('\n'),
       fallbackText: bodyTextBlocks.join('\n'),
-      imageUrls: imageUrls.slice(0, maxImages)
+      imageUrls: imageUrls.slice(0, maxImages),
+      imageFilterDebug
     };
   }, { maxImages: config.maxImages });
 }
@@ -512,7 +565,8 @@ async function extractListing(payload) {
           ogTitle: pageData.ogTitle,
           ogDescription: pageData.ogDescription,
           metaDescription: pageData.metaDescription,
-          jsonLdPrice: pageData.jsonLdPrice
+          jsonLdPrice: pageData.jsonLdPrice,
+          imageFilterDebug: pageData.imageFilterDebug
         }
       };
     }
