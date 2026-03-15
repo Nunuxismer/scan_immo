@@ -363,6 +363,11 @@ async function collectPageData(page) {
     const descriptionMeta = document.querySelector('meta[name="description"]')?.content || '';
     const ogTitle = document.querySelector('meta[property="og:title"]')?.content || '';
     const ogDescription = document.querySelector('meta[property="og:description"]')?.content || '';
+    const rawVisibleText = (document.body?.innerText || '')
+      .replace(/\r/g, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
 
     const jsonLdScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
     let jsonLdPrice = null;
@@ -528,6 +533,7 @@ async function collectPageData(page) {
       metaDescription: descriptionMeta,
       ogTitle,
       ogDescription,
+      rawVisibleText,
       jsonLdPrice,
       embeddedJsonText: embeddedJsonLines.join('\n'),
       cleanedMainText: mainTextBlocks.join('\n'),
@@ -893,6 +899,7 @@ function buildResponse({ requestId, sourceUrl, pageData, fields, images, errors,
     timestamps: {
       extracted_at: new Date().toISOString()
     },
+    raw_visible_text: pageData.rawVisibleText || '',
     images: {
       count: images.length,
       items: images.map((url, index) => ({
@@ -992,6 +999,7 @@ async function extractListing(payload) {
       timestamps: {
         extracted_at: new Date().toISOString()
       },
+      raw_visible_text: '',
       images: {
         count: 0,
         items: []
